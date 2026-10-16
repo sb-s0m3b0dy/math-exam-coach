@@ -1,0 +1,18 @@
+# 个人学习数据：不属于技能本身，不进公开仓库
+study/
+00-learner.md
+错题本.md
+records/
+导出/
+
+# 常见编辑器/系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# 若在本地做临时导出
+*.pdf
+*.docx
+tmp/
