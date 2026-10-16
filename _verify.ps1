@@ -6,6 +6,10 @@
 #   & ([scriptblock]::Create((Get-Content "<父目录>\_verify.ps1" -Raw -Encoding UTF8))) -Root "<父目录>"
 # 通过 -Root 定位，不依赖绝对路径，所以可随仓库分发到任何机器。
 # 注意：脚本内的占位符扫描会查运行时出现的那条命令，这是运行痕迹，不是文件里的占位符。
+#
+# 新增技能时：必须在下面的 $canonicalSources 里登记该技能的"状态源文件"（含表头定义的那个），
+# 否则自检会报 FAIL。登记后，其它文件里的表头会被拿来和状态源逐列比对，防止再次出现
+# "视图表头少一列、数据只能扔掉"的问题。
 
 param([string]$Root)
 
@@ -20,8 +24,10 @@ if (-not $Root) {
 
 if (Test-Path (Join-Path $Root "SKILL.md")) {
   $dirs = @(Get-Item $Root)
+  $singleSkillRoot = $true
 } else {
   $dirs = @(Get-ChildItem $Root -Directory | Where-Object { Test-Path (Join-Path $_.FullName "SKILL.md") })
+  $singleSkillRoot = $false
 }
 
 $fail = 0
@@ -150,6 +156,99 @@ foreach ($e in $extra) { Write-Output "       stale in table: $e" }
 Check ($etText -match '空间-三重积分（柱坐标/球坐标）') "cross-reference heading documented as exception"
 Write-Output "  INFO families=$($listed.Count) headings=$($src.Count) redirects=$($redirectHeadings.Count)"
 }
+
+# ---- schema 列一致性：视图表头必须与状态源 schema 完全一致 ----
+# 起因：error-tracking.md 把某列声明为"必填"，SKILL.md 的表头却没有那列 → 会真丢数据（曾发生）。
+# 规则来源是状态源文件里的表头本身，不硬编码列名，所以改 schema 时这条检查自动跟着变。
+Write-Output "=== schema: view header vs canonical schema ==="
+$mdFiles = @(Get-ChildItem $Root -Recurse -File -Filter *.md |
+  Where-Object { $_.FullName -notmatch '[\\/](\.git|node_modules|bin|obj|archive|导出)[\\/]' } |
+  Select-Object -ExpandProperty FullName)
+
+function Get-HeaderCells([string[]]$arr, [int]$start) {
+  # 找 $start 之后的第一条表格行（跳过代码围栏标记与 |---|---| 分隔行）
+  for ($i = $start; $i -lt $arr.Count; $i++) {
+    $line = $arr[$i].Trim()
+    if ($line -notmatch '^\|') { continue }
+    $cells = @($line.Trim('|') -split '\|' | ForEach-Object { $_.Trim() })
+    $isSep = $true
+    foreach ($c in $cells) { if ($c -ne '' -and $c -notmatch '^:?-{2,}:?$') { $isSep = $false; break } }
+    if ($isSep) { continue }
+    if ($cells.Count -gt 1) { return $cells }
+  }
+  return $null
+}
+
+# ① 每个技能的规范 schema 来源文件（状态源所在文件）。新增技能时必须在此登记。
+$canonicalSources = @{
+  'math-exam-coach' = 'references\error-tracking.md'
+  'time-planner'    = 'references\task-pool.md'
+}
+
+$viewCount = 0
+foreach ($skillDir in $dirs) {
+  $skillName = $skillDir.Name
+  if (-not $canonicalSources.ContainsKey($skillName)) {
+    Check $false "$skillName has no canonical schema source registered in _verify.ps1"
+    continue
+  }
+  $canonPath = Join-Path $skillDir.FullName $canonicalSources[$skillName]
+  Check (Test-Path $canonPath) "$skillName canonical schema file exists: $($canonicalSources[$skillName])"
+  if (-not (Test-Path $canonPath)) { continue }
+
+  # 规范列 = 状态源文件里每个「表头（列名固定…）」锚点后的表头
+  $canonLines = @((Get-Content $canonPath -Raw -Encoding UTF8) -split "\r?\n")
+  $canonSet = New-Object System.Collections.ArrayList
+  for ($j = 0; $j -lt $canonLines.Count; $j++) {
+    if ($canonLines[$j] -match '表头（列名固定') {
+      $hc = Get-HeaderCells $canonLines $j
+      if ($hc) { [void]$canonSet.Add($hc) }
+    }
+  }
+  Check ($canonSet.Count -gt 0) "$skillName canonical schema parsed from $(Split-Path $canonPath -Leaf) ($($canonSet.Count) schema(s))"
+  if ($canonSet.Count -eq 0) { continue }
+  Write-Output "  INFO $skillName canonical: $(($canonSet | ForEach-Object { $_.Count }) -join ',') columns"
+
+  # ② 该技能内**其它**文件的声明视图，必须与某套规范 schema 完全一致（列名与列数都要对）
+  $skillFiles = @(Get-ChildItem $skillDir.FullName -Recurse -File -Filter *.md |
+    Where-Object { $_.FullName -notmatch '[\\/](\.git|node_modules|archive|导出)[\\/]' })
+  foreach ($vf in $skillFiles) {
+    if ($vf.FullName -eq $canonPath) { continue }   # 规范自身的表头不作为视图比对
+    $va = @((Get-Content $vf.FullName -Raw -Encoding UTF8) -split "\r?\n")
+    $vh = -1
+    for ($j = 0; $j -lt $va.Count; $j++) { if ($va[$j] -match '表头（列名固定') { $vh = $j; break } }
+    if ($vh -lt 0) { continue }
+    $vcells = Get-HeaderCells $va $vh
+    if (-not $vcells) { continue }
+    $viewCount++
+    $matched = $false
+    foreach ($c in $canonSet) {
+      if ($vcells.Count -eq $c.Count -and @($c | Where-Object { $vcells -notcontains $_ }).Count -eq 0) { $matched = $true; break }
+    }
+    Check $matched "$skillName/$($vf.Name) view header matches a canonical schema ($($vcells.Count) cols)"
+    if (-not $matched) { Write-Output "       view: $($vcells -join ' / ')" }
+  }
+
+  # ③ 状态源自己的字段定义表：每个规范列都必须有一行定义
+  # 定义行形如 | `列名` | ... |，且允许一格合并多个列名（| `开始` / `结束` | ... |）
+  $defCols = @()
+  foreach ($dl in $canonLines) {
+    $first = [regex]::Match($dl, '^\|([^|]*)\|')
+    if (-not $first.Success) { continue }
+    foreach ($bm in [regex]::Matches($first.Groups[1].Value, '`([^`]+)`')) {
+      $defCols += $bm.Groups[1].Value.Trim()
+    }
+  }
+  foreach ($c in $canonSet) {
+    $undef = @($c | Where-Object { $defCols -notcontains $_ })
+    Check ($undef.Count -eq 0) "${skillName}: every canonical column has a definition row ($($undef.Count) undefined)"
+    foreach ($u in $undef) { Write-Output "       no definition row: $u" }
+  }
+}
+if (-not $singleSkillRoot) {
+  Check ($viewCount -ge 1) "at least one view header found to compare ($viewCount)"
+}
+Write-Output "  INFO view headers compared: $viewCount"
 
 Write-Output ""
 if ([int]$global:verifyFailCount -eq 0) { Write-Output "ALL CHECKS PASSED" }
